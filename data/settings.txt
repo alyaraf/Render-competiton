@@ -1,5 +1,5 @@
-launchSizeX: 3000
-launchSizeY: 2000
+launchSizeX: 2000
+launchSizeY: 3000
 launchSizeZ: 1
 patchSizeX: 200
 patchSizeY: 200
@@ -11,8 +11,8 @@ posYBlas0: -0.5
 posZBlas0: -0.98
 rotXBlas0: 0
 rotYBlas0: 0
-rotZBlas0: -70
-scaleBlas0: 1.8
+rotZBlas0: -90
+scaleBlas0: 1.4
 meshFileBlas1: StoneDemon
 modelModeBlas1: 1
 posXBlas1: -0.5
@@ -20,8 +20,8 @@ posYBlas1: -0.7
 posZBlas1: -0.675
 rotXBlas1: 0
 rotYBlas1: 0
-rotZBlas1: 0
-scaleBlas1: 1
+rotZBlas1: 90
+scaleBlas1: 0.8
 meshFileBlas2: VeachPlanes
 modelModeBlas2: 1
 posXBlas2: 0

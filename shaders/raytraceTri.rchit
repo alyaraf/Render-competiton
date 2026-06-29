@@ -44,6 +44,14 @@ layout(push_constant) uniform Constants
 #define texture2 textureSamplers[2]
 #define texture3 textureSamplers[3]
 #define texture4 textureSamplers[4]
+// NEW: concrete wall PBR texture set, see main.cpp additionalTextures comment.
+#define textureConcreteDiff textureSamplers[6]
+#define textureConcreteRough textureSamplers[7]
+#define textureConcreteNorm textureSamplers[8]
+// NEW: street rat PBR texture set, see main.cpp ratTextures comment.
+#define textureRatDiff textureSamplers[9]
+#define textureRatRough textureSamplers[10]
+#define textureRatNorm textureSamplers[11]
 
 void main()
 {   /**** CLOSEST-HIT SHADER ****/
@@ -72,40 +80,75 @@ void main()
   vec3 baseColor = vec3(0.8);
   bool isRefractive = false;
 
-  if(gl_InstanceID == 2) { // VeachPlanes - artistic cosine-gradient palette
-    vec3 paletteA = vec3(0.55, 0.45, 0.65);
-    vec3 paletteB = vec3(0.45, 0.45, 0.35);
-    vec3 paletteC = vec3(1.0, 1.0, 0.6);
-    vec3 paletteD = vec3(0.10, 0.45, 0.75);
-    float t = position.x * 0.6 + position.y * 0.35 + position.z * 0.2;
-    baseColor = clamp(paletteA + paletteB * cos(2.0 * PI * (paletteC * t + paletteD)), 0.0, 1.0);
-    roughness = 0.2;
+  if(gl_InstanceID == 2) { // VeachPlanes
+    // CHANGED: was an artistic cosine-gradient palette
+    // (baseColor = paletteA + paletteB * cos(...)); now uses the same concrete
+    // wall PBR texture set as DiscoBot/StoneDemon below.
+    vec2 tc = fract(texCoords * 2.0); // tile the wall texture across the UV unwrap
+    baseColor = pow(textureLod(textureConcreteDiff, tc, 0.0).rgb, vec3(2.2)) * 0.15;
+    roughness = textureLod(textureConcreteRough, tc, 0.0).r;
     fresnelReflect = 0.5;
-    clearcoat = 0.4;
+    clearcoat = 0.0;
+    if(payload.level == 0) {
+      vec3 gp0 = gl_ObjectToWorldEXT * vec4(p0, 1.0);
+      vec3 gp1 = gl_ObjectToWorldEXT * vec4(p1, 1.0);
+      vec3 gp2 = gl_ObjectToWorldEXT * vec4(p2, 1.0);
+      normal = applyNormalMap(textureConcreteNorm, tc, normal, gp1 - gp0, gp2 - gp0, t1 - t0, t2 - t0);
+    }
   }
-  else if(gl_InstanceID == 0) { // DiscoBot (blas0) - shimmering disco-ball cosine palette
-    vec3 discoA = vec3(0.5, 0.5, 0.5);
-    vec3 discoB = vec3(0.5, 0.5, 0.5);
-    vec3 discoC = vec3(2.0, 1.5, 1.0);
-    vec3 discoD = vec3(0.0, 0.25, 0.5);
-    float dt = normal.x * 0.5 + normal.y * 0.5 + normal.z * 0.3 + position.z * 0.4;
-    baseColor = clamp(discoA + discoB * cos(2.0 * PI * (discoC * dt + discoD)), 0.0, 1.0);
-    metallicness = 0.6;
-    roughness = 0.15;
-    fresnelReflect = 0.7;
-    clearcoat = 0.6; // shiny disco-ball sheen
-  }
-  else if(gl_InstanceID == 1) { // StoneDemon (blas1) - molten/hellish cosine palette
-    vec3 demonA = vec3(0.45, 0.20, 0.15);
-    vec3 demonB = vec3(0.45, 0.25, 0.10);
-    vec3 demonC = vec3(1.2, 1.0, 0.8);
-    vec3 demonD = vec3(0.0, 0.10, 0.30);
-    float mt = position.z * 0.8 + normal.y * 0.3;
-    baseColor = clamp(demonA + demonB * cos(2.0 * PI * (demonC * mt + demonD)), 0.0, 1.0);
-    metallicness = 0.1;
-    roughness = 0.35;
+  else if(gl_InstanceID == 0) { // DiscoBot (blas0)
+    // CHANGED: was a shimmering disco-ball cosine-gradient palette
+    // (baseColor = discoA + discoB * cos(...)); now uses the concrete wall PBR
+    // texture set (base color + roughness + normal map) instead.
+    vec2 tc = fract(texCoords * 2.0); // tile the wall texture across the UV unwrap
+    // CHANGED: darkened the concrete albedo (0.15x). The raw texture color
+    // looked washed-out/overexposed, both from this scene's bright area light
+    // and from indirect bounces off the bright HDR sky background; a 0.4x
+    // multiplier was tried first but still wasn't dark enough.
+    baseColor = pow(textureLod(textureConcreteDiff, tc, 0.0).rgb, vec3(2.2)) * 0.15;
+    roughness = textureLod(textureConcreteRough, tc, 0.0).r;
+    metallicness = 0.0;
     fresnelReflect = 0.5;
-    clearcoat = 0.3; // faint molten sheen
+    clearcoat = 0.0;
+    if(payload.level == 0) {
+      vec3 gp0 = gl_ObjectToWorldEXT * vec4(p0, 1.0);
+      vec3 gp1 = gl_ObjectToWorldEXT * vec4(p1, 1.0);
+      vec3 gp2 = gl_ObjectToWorldEXT * vec4(p2, 1.0);
+      normal = applyNormalMap(textureConcreteNorm, tc, normal, gp1 - gp0, gp2 - gp0, t1 - t0, t2 - t0);
+    }
+  }
+  else if(gl_InstanceID == 1) { // StoneDemon (blas1)
+    // CHANGED: was a molten/hellish cosine-gradient palette
+    // (baseColor = demonA + demonB * cos(...)); now uses the same concrete wall
+    // PBR texture set as DiscoBot above.
+    vec2 tc = fract(texCoords * 2.0); // tile the wall texture across the UV unwrap
+    // CHANGED: darkened the concrete albedo (0.15x), same reasoning as DiscoBot above.
+    baseColor = pow(textureLod(textureConcreteDiff, tc, 0.0).rgb, vec3(2.2)) * 0.15;
+    roughness = textureLod(textureConcreteRough, tc, 0.0).r;
+    metallicness = 0.0;
+    fresnelReflect = 0.5;
+    clearcoat = 0.0;
+    if(payload.level == 0) {
+      vec3 gp0 = gl_ObjectToWorldEXT * vec4(p0, 1.0);
+      vec3 gp1 = gl_ObjectToWorldEXT * vec4(p1, 1.0);
+      vec3 gp2 = gl_ObjectToWorldEXT * vec4(p2, 1.0);
+      normal = applyNormalMap(textureConcreteNorm, tc, normal, gp1 - gp0, gp2 - gp0, t1 - t0, t2 - t0);
+    }
+  }
+
+  else if(gl_InstanceID == 3) { // NEW: street rat (mesh3), standing between DiscoBot and StoneDemon
+    vec2 tc = fract(texCoords * 2.0); // tile across the UV unwrap
+    baseColor = pow(textureLod(textureRatDiff, tc, 0.0).rgb, vec3(2.2)) * 0.6;
+    roughness = textureLod(textureRatRough, tc, 0.0).r;
+    metallicness = 0.0;
+    fresnelReflect = 0.5;
+    clearcoat = 0.0;
+    if(payload.level == 0) {
+      vec3 gp0 = gl_ObjectToWorldEXT * vec4(p0, 1.0);
+      vec3 gp1 = gl_ObjectToWorldEXT * vec4(p1, 1.0);
+      vec3 gp2 = gl_ObjectToWorldEXT * vec4(p2, 1.0);
+      normal = applyNormalMap(textureRatNorm, tc, normal, gp1 - gp0, gp2 - gp0, t1 - t0, t2 - t0);
+    }
   }
 
   vec3 lightPos = vec3(0.5, -2.0, 0.7) + normalize(random_pcg3d(uvec3(frameID, gl_LaunchIDEXT.xy))) * 0.2;

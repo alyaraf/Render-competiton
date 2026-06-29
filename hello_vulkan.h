@@ -128,6 +128,15 @@ public:
   vk::PipelineLayout          m_postPipelineLayout;
   vk::RenderPass              m_offscreenRenderPass;
   vk::Framebuffer             m_offscreenFramebuffer;
+  // NEW: resolution of the offscreen ray-traced image (settings.launchSizeX/Y),
+  // decoupled from m_size (the GLFW window/swapchain size). m_size gets clamped
+  // by Vulkan surface capabilities to fit the monitor (e.g. a 2000x3000 request
+  // was silently clamped to ~1924x1055 on a 1920x1080 display), so the offscreen
+  // render/raytrace dispatch/screenshot now use m_renderSize instead, letting
+  // the saved image be larger than the screen while the on-screen window still
+  // fits. Set once in HelloVulkan::setRenderSize(), called from main.cpp right
+  // after loadSettings().
+  vk::Extent2D                m_renderSize{0, 0};
   nvvk::Texture               m_offscreenColor;
   vk::Format                  m_offscreenColorFormat{vk::Format::eR32G32B32A32Sfloat};
   nvvk::Texture               m_offscreenDepth;
@@ -226,6 +235,12 @@ public:
   bool loadSettings(const std::string& filename);
   void resetFrameCounter();
   void hideGui();
+  // NEW: saves the current contents of the offscreen ray-traced image
+  // (m_offscreenColor) to a PNG file on disk.
+  void saveScreenshot(const std::string& filename);
+  // NEW: sets m_renderSize (see its declaration above for why it's separate
+  // from m_size).
+  void setRenderSize(uint32_t width, uint32_t height) { m_renderSize = vk::Extent2D{width, height}; }
 
   private:
     std::string determineFileType(const std::string& filename);

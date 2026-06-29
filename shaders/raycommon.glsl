@@ -183,7 +183,10 @@ vec3 sampleMicrofacetBRDF(in vec3 V, in vec3 N,
 }
 
 // UPGRADE: Depth of Field (camera lens) settings
-const float aperture  = 0.045; // lens radius: bigger = stronger blur
+// CHANGED: aperture was 0.045, which blurred the background HDR so heavily it
+// barely showed any detail. Lowered to keep DOF subtle while still showing the
+// background environment clearly.
+const float aperture  = 0.012; // lens radius: bigger = stronger blur
 const float focusDist = 4.2;   // distance from camera to the in-focus plane
 
 // UPGRADE: Procedural marble (turbulent veins) and wood (concentric rings) materials
@@ -225,6 +228,28 @@ vec3 woodColor(vec3 p, vec3 lightWood, vec3 darkWood) {
   float rings = fract(radius * 6.0);
   rings = smoothstep(0.0, 0.15, rings) * smoothstep(1.0, 0.85, rings);
   return mix(darkWood, lightWood, rings);
+}
+
+// NEW: tangent-space normal mapping, used to apply the concrete wall normal map
+// (data/concreteNorm.png) to DiscoBot and StoneDemon in raytraceTri.rchit /
+// raytraceAabb.rchit. Builds a per-triangle tangent frame from the triangle's
+// world-space edges and UV deltas (no precomputed vertex tangents needed).
+mat3 cotangentFrame(in vec3 N, in vec3 dp1, in vec3 dp2, in vec2 duv1, in vec2 duv2)
+{
+    vec3 dp2perp = cross( dp2, N );
+    vec3 dp1perp = cross( N, dp1 );
+    vec3 T = dp2perp * duv1.x + dp1perp * duv2.x;
+    vec3 B = dp2perp * duv1.y + dp1perp * duv2.y;
+    float invmax = inversesqrt( max( dot(T,T), dot(B,B) ) );
+    return mat3( T * invmax, B * invmax, N );
+}
+
+vec3 applyNormalMap(in sampler2D normalmap, vec2 texcoord, in vec3 normal, in vec3 edge0, in vec3 edge1, in vec2 texDiff0, in vec2 texDiff1)
+{
+    vec3 highResNormal = textureLod(normalmap, texcoord, 0.0).rgb;
+    highResNormal = normalize(highResNormal * 2.0 - 1.0);
+    mat3 TBN = cotangentFrame(normal, edge0, edge1, texDiff0, texDiff1);
+    return normalize(TBN * highResNormal);
 }
 /**** COMMON END ****/
 

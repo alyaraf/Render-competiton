@@ -34,6 +34,10 @@ extern std::vector<std::string> defaultSearchPaths;
 #include "obj_loader.h"
 #include "stb_image.h"
 
+// NEW: used by saveScreenshot() to write the rendered image out to a PNG file.
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
+
 #include "hello_vulkan.h"
 #include "nvh//cameramanipulator.hpp"
 #include "nvvk/descriptorsets_vk.hpp"
@@ -77,7 +81,10 @@ void HelloVulkan::setup(const vk::Instance&       instance,
 void HelloVulkan::updateUniformBuffer(const vk::CommandBuffer& cmdBuf)
 {
   // Prepare new UBO contents on host.
-  const float aspectRatio = m_size.width / static_cast<float>(m_size.height);
+  // CHANGED: was m_size (window/swapchain size); use m_renderSize (the
+  // offscreen ray-traced resolution) so the raster fallback path's aspect
+  // ratio matches what it's actually drawing into.
+  const float aspectRatio = m_renderSize.width / static_cast<float>(m_renderSize.height);
   CameraMatrices hostUBO = {};
   hostUBO.view           = CameraManip.getMatrix();
   hostUBO.proj           = nvmath::perspectiveVK(CameraManip.getFov(), aspectRatio, 0.1f, 1000.0f);
@@ -570,8 +577,40 @@ void HelloVulkan::createTextureImages(const vk::CommandBuffer&        cmdBuf,
       int texWidth, texHeight, texChannels;
       float* pixels;
       std::vector<float> floatPixels;
-      bool floatImageFound = this->loadPFM(texture, texWidth, texHeight, floatPixels);
-      if(floatImageFound)
+      // NEW: Radiance (.hdr) environment map support, added for the background.hdr
+      // sky texture. This loader previously only handled ".pfm" (via loadPFM) and
+      // 8-bit ".png" (via stbi_load below); ".hdr" needs stbi_loadf since the data
+      // is already linear floating-point and must not be divided by 255 like the
+      // 8-bit path does.
+      bool isHdr = texture.size() >= 4 && texture.substr(texture.size() - 4) == ".hdr";
+      bool floatImageFound = !isHdr && this->loadPFM(texture, texWidth, texHeight, floatPixels);
+      if(isHdr)
+      {
+        float* hdrPixels =
+            stbi_loadf(texture.c_str(), &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
+        if(!hdrPixels)
+        {
+          std::array<float, 4> colorBackup{0.0, 0.0, 0.0, 1.0};
+          texWidth = texHeight = 1;
+          pixels               = colorBackup.data();
+        }
+        else
+        {
+          // Flip vertically (same convention as the PNG path below) since the
+          // miss shader samples with v=0 at the top of the image.
+          texChannels = 4;
+          floatPixels.resize(static_cast<size_t>(texWidth) * texHeight * texChannels);
+          int nn = texWidth * texChannels;
+          for(int y = 0; y < texHeight; y++) {
+            for(int xx = 0; xx < nn; xx++) {
+              floatPixels[y * nn + xx] = hdrPixels[(texHeight - 1 - y) * nn + xx];
+            }
+          }
+          pixels = floatPixels.data();
+          stbi_image_free(hdrPixels);
+        }
+      }
+      else if(floatImageFound)
       {
         pixels = floatPixels.data();
       }else {
@@ -688,8 +727,10 @@ void HelloVulkan::rasterize(const vk::CommandBuffer& cmdBuf)
   m_debug.beginLabel(cmdBuf, "Rasterize");
 
   // Dynamic Viewport
-  cmdBuf.setViewport(0, {vk::Viewport(0, 0, (float)m_size.width, (float)m_size.height, 0, 1)});
-  cmdBuf.setScissor(0, {{{0, 0}, {m_size.width, m_size.height}}});
+  // CHANGED: was m_size; this draws into the offscreen framebuffer
+  // (m_offscreenFramebuffer), which is now sized m_renderSize, not m_size.
+  cmdBuf.setViewport(0, {vk::Viewport(0, 0, (float)m_renderSize.width, (float)m_renderSize.height, 0, 1)});
+  cmdBuf.setScissor(0, {{{0, 0}, {m_renderSize.width, m_renderSize.height}}});
 
   // Drawing all triangles
   cmdBuf.bindPipeline(vkPBP::eGraphics, m_graphicsPipeline);
@@ -734,8 +775,11 @@ void HelloVulkan::createOffscreenRender()
   m_alloc.destroy(m_offscreenDepth);
 
   // Creating the color image
+  // CHANGED: was sized m_size (window/swapchain size, clamped to the monitor);
+  // now sized m_renderSize (settings.launchSizeX/Y) so the ray-traced image
+  // resolution doesn't depend on the screen's resolution.
   {
-    auto colorCreateInfo = nvvk::makeImage2DCreateInfo(m_size, m_offscreenColorFormat,
+    auto colorCreateInfo = nvvk::makeImage2DCreateInfo(m_renderSize, m_offscreenColorFormat,
                                                        vk::ImageUsageFlagBits::eColorAttachment
                                                            | vk::ImageUsageFlagBits::eSampled
                                                            | vk::ImageUsageFlagBits::eStorage);
@@ -748,8 +792,9 @@ void HelloVulkan::createOffscreenRender()
   }
 
   // Creating the depth buffer
+  // CHANGED: was m_size, see color image comment above.
   auto depthCreateInfo =
-      nvvk::makeImage2DCreateInfo(m_size, m_offscreenDepthFormat,
+      nvvk::makeImage2DCreateInfo(m_renderSize, m_offscreenDepthFormat,
                                   vk::ImageUsageFlagBits::eDepthStencilAttachment);
   {
     nvvk::Image image = m_alloc.createImage(depthCreateInfo);
@@ -793,8 +838,9 @@ void HelloVulkan::createOffscreenRender()
   info.setRenderPass(m_offscreenRenderPass);
   info.setAttachmentCount(2);
   info.setPAttachments(attachments.data());
-  info.setWidth(m_size.width);
-  info.setHeight(m_size.height);
+  // CHANGED: was m_size; must match the m_renderSize-sized attachments above.
+  info.setWidth(m_renderSize.width);
+  info.setHeight(m_renderSize.height);
   info.setLayers(1);
   m_offscreenFramebuffer = m_device.createFramebuffer(info);
 }
@@ -1136,6 +1182,24 @@ void HelloVulkan::createTopLevelAS()
     }
   }
 
+  // NEW: street rat (m_objModel index 3). Always added as a plain triangle
+  // instance, separate from the triangle/AABB toggle loop above, since it has
+  // no associated AABB data and doesn't need the mode-switching behavior.
+  // Pushed last, so it becomes gl_InstanceID == 3 in raytraceTri.rchit (the
+  // gl_InstanceID branches there check the build-order index in this `tlas`
+  // vector, not instanceCustomIndex).
+  if(m_objModel.size() > 3)
+  {
+    VkAccelerationStructureInstanceKHR rayInst{};
+    rayInst.transform = nvvk::toTransformMatrixKHR(m_objInstance[3].transform);
+    rayInst.instanceCustomIndex             = 3;
+    rayInst.accelerationStructureReference  = m_rtBuilder.getBlasDeviceAddress(m_objInstance[3].objIndex);
+    rayInst.instanceShaderBindingTableRecordOffset = 0;  // raytraceTri hit group
+    rayInst.flags                           = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+    rayInst.mask                            = 0x08;
+    tlas.emplace_back(rayInst);
+  }
+
   m_rtBuilder.buildTlas(tlas, vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace);
 }
 
@@ -1297,8 +1361,7 @@ void HelloVulkan::createRtPipeline()
 
   rayPipelineInfo.setMaxPipelineRayRecursionDepth(2);  // Ray depth
   rayPipelineInfo.setLayout(m_rtPipelineLayout);
-  m_rtPipeline = static_cast<const vk::Pipeline&>(
-      m_device.createRayTracingPipelineKHR({}, {}, rayPipelineInfo));
+  m_rtPipeline = m_device.createRayTracingPipelineKHR({}, {}, rayPipelineInfo).value;
 
   m_device.destroy(raygenSM);
   m_device.destroy(missSM);
@@ -1401,9 +1464,12 @@ void HelloVulkan::raytrace(const vk::CommandBuffer& cmdBuf, const nvmath::vec4f&
       Stride{sbtAddress + 3u * groupSize, groupStride, groupSize * 1},  // hit
       Stride{0u, 0u, 0u}};                                              // callable
 
+  // CHANGED: was m_size (window/swapchain size); use m_renderSize so
+  // gl_LaunchSizeEXT in the shaders matches the full requested render
+  // resolution, not whatever the swapchain got clamped to for the screen.
   cmdBuf.traceRaysKHR(&strideAddresses[0], &strideAddresses[1], &strideAddresses[2],
-                      &strideAddresses[3],              //
-                      m_size.width, m_size.height, 1);  //
+                      &strideAddresses[3],                          //
+                      m_renderSize.width, m_renderSize.height, 1);  //
 
   m_debug.endLabel(cmdBuf);
 }
@@ -1506,4 +1572,51 @@ void HelloVulkan::resetFrameCounter() {
 void HelloVulkan::hideGui()
 {
   m_show_gui = false;
+}
+
+// NEW: copies the offscreen ray-traced image (m_offscreenColor, R32G32B32A32Sfloat,
+// already gamma-corrected by the raygen shader) to a host-visible staging buffer
+// and writes it out as an 8-bit PNG via stb_image_write.
+void HelloVulkan::saveScreenshot(const std::string& filename)
+{
+  // CHANGED: was m_size throughout this function; use m_renderSize so the
+  // saved PNG is the full requested render resolution, not the (possibly
+  // screen-clamped) window/swapchain size.
+  vk::DeviceSize bufferSize =
+      static_cast<vk::DeviceSize>(m_renderSize.width) * m_renderSize.height * 4 * sizeof(float);
+
+  nvvk::CommandPool genCmdBuf(m_device, m_graphicsQueueIndex);
+  vk::CommandBuffer cmdBuf = genCmdBuf.createCommandBuffer();
+
+  nvvk::Buffer stagingBuffer =
+      m_alloc.createBuffer(bufferSize, vk::BufferUsageFlagBits::eTransferDst,
+                            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+
+  nvvk::cmdBarrierImageLayout(cmdBuf, m_offscreenColor.image, vk::ImageLayout::eGeneral,
+                              vk::ImageLayout::eTransferSrcOptimal);
+
+  vk::BufferImageCopy copyRegion;
+  copyRegion.setImageSubresource({vk::ImageAspectFlagBits::eColor, 0, 0, 1});
+  copyRegion.setImageExtent({m_renderSize.width, m_renderSize.height, 1});
+  cmdBuf.copyImageToBuffer(m_offscreenColor.image, vk::ImageLayout::eTransferSrcOptimal,
+                            stagingBuffer.buffer, 1, &copyRegion);
+
+  nvvk::cmdBarrierImageLayout(cmdBuf, m_offscreenColor.image, vk::ImageLayout::eTransferSrcOptimal,
+                              vk::ImageLayout::eGeneral);
+
+  genCmdBuf.submitAndWait(cmdBuf);
+
+  const float*  floatData = reinterpret_cast<const float*>(m_alloc.map(stagingBuffer));
+  size_t        pixelCount = static_cast<size_t>(m_renderSize.width) * m_renderSize.height * 4;
+  std::vector<unsigned char> pixels(pixelCount);
+  for(size_t i = 0; i < pixelCount; i++)
+  {
+    float v   = std::min(std::max(floatData[i], 0.0f), 1.0f);
+    pixels[i] = static_cast<unsigned char>(v * 255.0f + 0.5f);
+  }
+  m_alloc.unmap(stagingBuffer);
+  m_alloc.destroy(stagingBuffer);
+
+  stbi_write_png(filename.c_str(), static_cast<int>(m_renderSize.width), static_cast<int>(m_renderSize.height),
+                 4, pixels.data(), static_cast<int>(m_renderSize.width) * 4);
 }

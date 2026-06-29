@@ -1,539 +1,144 @@
-﻿# Intersection Shader - Tutorial
-
-![](images/intersection.png)
-<small>Author: [Martin-Karl Lefrançois](https://devblogs.nvidia.com/author/mlefrancois/)</small>
-
-
-## Tutorial ([Setup](../docs/setup.md))
-
-This is an extension of the Vulkan ray tracing [tutorial](https://nvpro-samples.github.io/vk_raytracing_tutorial_KHR).
-
-This tutorial chapter shows how to use intersection shader and render different primitives with different materials.
-
-
-## High Level Implementation
-
-On a high level view, we will
-
-* Add 2.000.000 axis aligned bounding boxes in a BLAS
-* 2 materials will be added
-* Every second intersected object will be a sphere or a cube and will use one of the two material.
-
-To do this, we will need to:
-
-* Add an intersection shader (.rint)
-* Add a new closest hit shader (.chit)
-* Create `VkAccelerationStructureGeometryKHR` from `VkAccelerationStructureGeometryAabbsDataKHR`
-
-## Creating all spheres
-
-In the HelloVulkan class, we will add the structures we will need. First the structure that defines a sphere.
-
-~~~~ C++
-  struct Sphere
-  {
-    nvmath::vec3f center;
-    float         radius;
-  };
-~~~~
-
-Then we need the Aabb structure holding all the spheres, but also used for the creation of the BLAS (`VK_GEOMETRY_TYPE_AABBS_KHR`). 
-
-~~~~ C++
-  struct Aabb
-  {
-    nvmath::vec3f minimum;
-    nvmath::vec3f maximum;
-  };
-~~~~
-
-All the information will need to be hold in buffers, which will be available to the shaders.
-
-~~~~ C++
-  std::vector<Sphere> m_spheres;                // All spheres
-  nvvkBuffer          m_spheresBuffer;          // Buffer holding the spheres
-  nvvkBuffer          m_spheresAabbBuffer;      // Buffer of all Aabb
-  nvvkBuffer          m_spheresMatColorBuffer;  // Multiple materials
-  nvvkBuffer          m_spheresMatIndexBuffer;  // Define which sphere uses which material
-~~~~
-
-Finally, there are two functions, one to create the spheres, and one that will create the intermediate structure for the BLAS.
-
-~~~~ C++
-  void                              createSpheres();
-  nvvk::RaytracingBuilderKHR::Blas  sphereToVkGeometryKHR();
-~~~~
-
-The following implementation will create 2.000.000 spheres at random positions and radius. It will create the Aabb from the sphere definition, two materials which will be assigned alternatively to each object. All the created information will be moved to Vulkan buffers to be accessed by the intersection and closest shaders.
-
-~~~~ C++
-
-//--------------------------------------------------------------------------------------------------
-// Creating all spheres
-//
-void HelloVulkan::createSpheres()
-{
-  std::random_device                    rd{};
-  std::mt19937                          gen{rd()};
-  std::normal_distribution<float>       xzd{0.f, 5.f};
-  std::normal_distribution<float>       yd{3.f, 1.f};
-  std::uniform_real_distribution<float> radd{.05f, .2f};
-
-  // All spheres
-  Sphere s;
-  for(uint32_t i = 0; i < 2000000; i++)
-  {
-    s.center = nvmath::vec3f(xzd(gen), yd(gen), xzd(gen));
-    s.radius = radd(gen);
-    m_spheres.emplace_back(s);
-  }
-
-  // Axis aligned bounding box of each sphere
-  std::vector<Aabb> aabbs;
-  for(const auto& s : m_spheres)
-  {
-    Aabb aabb;
-    aabb.minimum = s.center - nvmath::vec3f(s.radius);
-    aabb.maximum = s.center + nvmath::vec3f(s.radius);
-    aabbs.emplace_back(aabb);
-  }
-
-  // Creating two materials
-  MatrialObj mat;
-  mat.diffuse = vec3f(0, 1, 1);
-  std::vector<MatrialObj> materials;
-  std::vector<int>        matIdx;
-  materials.emplace_back(mat);
-  mat.diffuse = vec3f(1, 1, 0);
-  materials.emplace_back(mat);
-
-  // Assign a material to each sphere
-  for(size_t i = 0; i < m_spheres.size(); i++)
-  {
-    matIdx.push_back(i % 2);
-  }
-
-  // Creating all buffers
-  using vkBU = vk::BufferUsageFlagBits;
-  nvvk::CommandPool genCmdBuf(m_device, m_graphicsQueueIndex);
-  auto              cmdBuf = genCmdBuf.createCommandBuffer();
-  m_spheresBuffer          = m_alloc.createBuffer(cmdBuf, m_spheres, vkBU::eStorageBuffer);
-  m_spheresAabbBuffer      = m_alloc.createBuffer(cmdBuf, aabbs, vkBU::eShaderDeviceAddress);
-  m_spheresMatIndexBuffer  = m_alloc.createBuffer(cmdBuf, matIdx, vkBU::eStorageBuffer);
-  m_spheresMatColorBuffer  = m_alloc.createBuffer(cmdBuf, materials, vkBU::eStorageBuffer);
-  genCmdBuf.submitAndWait(cmdBuf);
-
-  // Debug information
-  m_debug.setObjectName(m_spheresBuffer.buffer, "spheres");
-  m_debug.setObjectName(m_spheresAabbBuffer.buffer, "spheresAabb");
-  m_debug.setObjectName(m_spheresMatColorBuffer.buffer, "spheresMat");
-  m_debug.setObjectName(m_spheresMatIndexBuffer.buffer, "spheresMatIdx");
-}
-~~~~
-
-Do not forget to destroy the buffers in `destroyResources()`
-
-~~~~ C++
-  m_alloc.destroy(m_spheresBuffer);
-  m_alloc.destroy(m_spheresAabbBuffer);
-  m_alloc.destroy(m_spheresMatColorBuffer);
-  m_alloc.destroy(m_spheresMatIndexBuffer);
-~~~~
-
-We need a new bottom level acceleration structure (BLAS) to hold the implicit primitives. For efficiency and since all those primitives are static, they will all be added in a single BLAS.
-
-What is changing compare to triangle primitive is the Aabb data (see Aabb structure) and the geometry type (`VK_GEOMETRY_TYPE_AABBS_KHR`).
-
-~~~~ C++
-//--------------------------------------------------------------------------------------------------
-// Returning the ray tracing geometry used for the BLAS, containing all spheres
-//
-nvvk::RaytracingBuilderKHR::Blas HelloVulkan::sphereToVkGeometryKHR()
-{
-  vk::AccelerationStructureCreateGeometryTypeInfoKHR asCreate;
-  asCreate.setGeometryType(vk::GeometryTypeKHR::eAabbs);
-  asCreate.setMaxPrimitiveCount((uint32_t)m_spheres.size());  // Nb triangles
-  asCreate.setIndexType(vk::IndexType::eNoneKHR);
-  asCreate.setVertexFormat(vk::Format::eUndefined);
-  asCreate.setMaxVertexCount(0);
-  asCreate.setAllowsTransforms(VK_FALSE);  // No adding transformation matrices
-
-
-  vk::DeviceAddress dataAddress = m_device.getBufferAddress({m_spheresAabbBuffer.buffer});
-  vk::AccelerationStructureGeometryAabbsDataKHR aabbs;
-  aabbs.setData(dataAddress);
-  aabbs.setStride(sizeof(Aabb));
-
-  // Setting up the build info of the acceleration
-  vk::AccelerationStructureGeometryKHR asGeom;
-  asGeom.setGeometryType(asCreate.geometryType);
-  asGeom.setFlags(vk::GeometryFlagBitsKHR::eOpaque);
-  asGeom.geometry.setAabbs(aabbs);
-
-  vk::AccelerationStructureBuildOffsetInfoKHR offset;
-  offset.setFirstVertex(0);
-  offset.setPrimitiveCount(asCreate.maxPrimitiveCount);
-  offset.setPrimitiveOffset(0);
-  offset.setTransformOffset(0);
-
-  nvvk::RaytracingBuilderKHR::Blas blas;
-  blas.asGeometry.emplace_back(asGeom);
-  blas.asCreateGeometryInfo.emplace_back(asCreate);
-  blas.asBuildOffsetInfo.emplace_back(offset);
-  return blas;
-}
-~~~~
-
-## Setting Up the Scene
-
-In `main.cpp`, where we are loading the OBJ model, we can replace it with
-
-~~~~ C++
-  // Creation of the example
-  helloVk.loadModel(nvh::findFile("media/scenes/plane.obj", defaultSearchPaths, true));
-  helloVk.createSpheres();
-~~~~
-
- **Note:** it is possible to have more OBJ models, but the spheres will need to be added after all of them.
-
-The scene will be large, better to move the camera out
-
-~~~~ C++
-  CameraManip.setLookat(nvmath::vec3f(20, 20, 20), nvmath::vec3f(0, 1, 0), nvmath::vec3f(0, 1, 0));
-~~~~
-
-## Acceleration Structures
-
-### BLAS
-
-The function `createBottomLevelAS()` is creating a BLAS per OBJ, the following modification will add a new BLAS containing the Aabb's of all spheres.
-
-~~~~ C++
-void HelloVulkan::createBottomLevelAS()
-{
-  // BLAS - Storing each primitive in a geometry
-  std::vector<nvvk::RaytracingBuilderKHR::Blas> allBlas;
-  allBlas.reserve(m_objModel.size());
-  for(const auto& obj : m_objModel)
-  {
-    auto blas = objectToVkGeometryKHR(obj);
-
-    // We could add more geometry in each BLAS, but we add only one for now
-    allBlas.emplace_back(blas);
-  }
-
-  // Spheres
-  {
-    auto blas = sphereToVkGeometryKHR();
-    allBlas.emplace_back(blas);
-  }
-
-  m_rtBuilder.buildBlas(allBlas, vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace);
-}
-~~~~
-
-### TLAS
-
-Similarly in `createTopLevelAS()`, the top level acceleration structure will need to add a reference to the BLAS of the spheres. We are setting the instanceCustomId and blasId to the last element, which is why the sphere BLAS must be added after everything else.
-
-The hitGroupId will be set to 1 instead of 0. We need to add a new hit group for the implicit primitives, since we will need to compute attributes like the  normal, since they are not provide like with triangle primitives.
-
-Just before building the TLAS, we need to add the following
-
-~~~~ C++
-  // Add the blas containing all spheres
-  {
-    nvvk::RaytracingBuilder::Instance rayInst;
-    rayInst.transform        = m_objInstance[0].transform;          // Position of the instance
-    rayInst.instanceCustomId = static_cast<uint32_t>(tlas.size());  // gl_InstanceCustomIndexEXT
-    rayInst.blasId           = static_cast<uint32_t>(m_objModel.size());
-    rayInst.hitGroupId       = 1;  // We will use the same hit group for all objects
-    rayInst.flags            = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-    tlas.emplace_back(rayInst);
-  }
-~~~~
-
-## Descriptors
-
-To access the newly created buffers holding all the spheres and materials, some changes are required to the descriptors.
-
-In function `createDescriptorSetLayout()`, the addition of the material and material index need to be instructed.
-
-~~~~ C++
-  // Materials (binding = 1)
-  m_descSetLayoutBind.emplace_back(vkDS(1, vkDT::eStorageBuffer, nbObj + 1,
-                                        vkSS::eVertex | vkSS::eFragment | vkSS::eClosestHitKHR));
-  // Materials Index (binding = 4)
-  m_descSetLayoutBind.emplace_back(
-      vkDS(4, vkDT::eStorageBuffer, nbObj + 1, vkSS::eFragment | vkSS::eClosestHitKHR));
-~~~~
-
-And the new buffer holding the spheres
-
-~~~~ C++
-  // Storing spheres (binding = 7)
-  m_descSetLayoutBind.emplace_back(  //
-      vkDS(7, vkDT::eStorageBuffer, 1, vkSS::eClosestHitKHR | vkSS::eIntersectionKHR));
-~~~~
-
-The function `updateDescriptorSet()` which is writing the values of the buffer need also to be modified.
-
-At the end of the loop on all models, lets add the new material and material index.
-
-~~~~ C++
-  for(auto& model : m_objModel)
-  {
-    dbiMat.emplace_back(model.matColorBuffer.buffer, 0, VK_WHOLE_SIZE);
-    dbiMatIdx.emplace_back(model.matIndexBuffer.buffer, 0, VK_WHOLE_SIZE);
-    dbiVert.emplace_back(model.vertexBuffer.buffer, 0, VK_WHOLE_SIZE);
-    dbiIdx.emplace_back(model.indexBuffer.buffer, 0, VK_WHOLE_SIZE);
-  }
-  dbiMat.emplace_back(m_spheresMatColorBuffer.buffer, 0, VK_WHOLE_SIZE);
-  dbiMatIdx.emplace_back(m_spheresMatIndexBuffer.buffer, 0, VK_WHOLE_SIZE);
-~~~~
-
-Then write the buffer for the spheres
-
-~~~~ C++
-  vk::DescriptorBufferInfo dbiSpheres{m_spheresBuffer.buffer, 0, VK_WHOLE_SIZE};
-  writes.emplace_back(m_descSetLayoutBind.makeWrite(m_descSet, 7, dbiSpheres));
-~~~~
-
-## Intersection Shader
-
-The intersection shader is added to the Hit Group `VK_RAY_TRACING_SHADER_GROUP_TYPE_PROCEDURAL_HIT_GROUP_KHR`. In our example, we already have a Hit Group for triangle and a closest hit associated. We will add a new one, which will become the Hit Group ID (1), see the TLAS section.
-
-Here is how the two hit group looks like:
-
-~~~~ C++
-  // Hit Group0 - Closest Hit
-  vk::ShaderModule chitSM =
-      nvvk::createShaderModule(m_device,  //
-                               nvh::loadFile("shaders/raytrace.rchit.spv", true, paths));
-
-  {
-    vk::RayTracingShaderGroupCreateInfoKHR hg{vk::RayTracingShaderGroupTypeKHR::eTrianglesHitGroup,
-                                              VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR,
-                                              VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR};
-    stages.push_back({{}, vk::ShaderStageFlagBits::eClosestHitKHR, chitSM, "main"});
-    hg.setClosestHitShader(static_cast<uint32_t>(stages.size() - 1));
-    m_rtShaderGroups.push_back(hg);
-  }
-
-  // Hit Group1 - Closest Hit + Intersection (procedural)
-  vk::ShaderModule chit2SM =
-      nvvk::createShaderModule(m_device,  //
-                               nvh::loadFile("shaders/raytrace2.rchit.spv", true, paths));
-  vk::ShaderModule rintSM =
-      nvvk::createShaderModule(m_device,  //
-                               nvh::loadFile("shaders/raytrace.rint.spv", true, paths));
-  {
-    vk::RayTracingShaderGroupCreateInfoKHR hg{vk::RayTracingShaderGroupTypeKHR::eProceduralHitGroup,
-                                              VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR,
-                                              VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR};
-    stages.push_back({{}, vk::ShaderStageFlagBits::eClosestHitKHR, chit2SM, "main"});
-    hg.setClosestHitShader(static_cast<uint32_t>(stages.size() - 1));
-    stages.push_back({{}, vk::ShaderStageFlagBits::eIntersectionKHR, rintSM, "main"});
-    hg.setIntersectionShader(static_cast<uint32_t>(stages.size() - 1));
-    m_rtShaderGroups.push_back(hg);
-  }
-~~~~
-
-And destroy the two shaders at the end
-
-~~~~ C++
-  m_device.destroy(chit2SM);
-  m_device.destroy(rintSM);
-~~~~
-
-### raycommon.glsl
-
-To share the structure of the data across the shaders, we can add the following to `raycommon.glsl`
-
-~~~~ C++
-struct Sphere
-{
-  vec3  center;
-  float radius;
-};
-
-struct Aabb
-{
-  vec3 minimum;
-  vec3 maximum;
-};
-
-#define KIND_SPHERE 0
-#define KIND_CUBE 1
-~~~~
-
-### raytrace.rint
-
-The intersection shader `raytrace.rint` need to be added to the shader directory and CMake to be rerun such that it is added to the project. The shader will be called every time a ray will hit one of the Aabb of the scene. Note that there are no Aabb information that can be retrieved in the intersection shader. It is also not possible to have the value of the hit point that the ray tracer might have calculated on the GPU.
-
-The only information we have is that one of the Aabb was hit and using the `gl_PrimitiveID`, it is possible to know which one it was. Then, with the information stored in the buffer, we can retrive the geometry information of the sphere.
-
-We first declare the extensions and include common files.
-
-~~~~ C++
-#version 460
-#extension GL_EXT_ray_tracing : require
-#extension GL_EXT_nonuniform_qualifier : enable
-#extension GL_EXT_scalar_block_layout : enable
-#extension GL_GOOGLE_include_directive : enable
-#include "raycommon.glsl"
-#include "wavefront.glsl"
-~~~~
-
-
-The following is the topology of all spheres, which we will be able to retrieve using `gl_PrimitiveID`.
-
-~~~~ C++
-layout(binding = 7, set = 1, scalar) buffer allSpheres_
-{
-  Sphere i[];
-}
-allSpheres;
-~~~~
-
-We will implement two intersetion method against the incoming ray.
-
-~~~~ C++
-struct Ray
-{
-  vec3 origin;
-  vec3 direction;
-};
-~~~~
-
-The sphere intersection
-
-~~~~ C++
-// Ray-Sphere intersection
-// http://viclw17.github.io/2018/07/16/raytracing-ray-sphere-intersection/
-float hitSphere(const Sphere s, const Ray r)
-{
-  vec3  oc           = r.origin - s.center;
-  float a            = dot(r.direction, r.direction);
-  float b            = 2.0 * dot(oc, r.direction);
-  float c            = dot(oc, oc) - s.radius * s.radius;
-  float discriminant = b * b - 4 * a * c;
-  if(discriminant < 0)
-  {
-    return -1.0;
-  }
-  else
-  {
-    return (-b - sqrt(discriminant)) / (2.0 * a);
-  }
-}
-~~~~
-
-And the axis aligned bounding box intersection
-
-~~~~ C++
-// Ray-AABB intersection
-float hitAabb(const Aabb aabb, const Ray r)
-{
-  vec3  invDir = 1.0 / r.direction;
-  vec3  tbot   = invDir * (aabb.minimum - r.origin);
-  vec3  ttop   = invDir * (aabb.maximum - r.origin);
-  vec3  tmin   = min(ttop, tbot);
-  vec3  tmax   = max(ttop, tbot);
-  float t0     = max(tmin.x, max(tmin.y, tmin.z));
-  float t1     = min(tmax.x, min(tmax.y, tmax.z));
-  return t1 > max(t0, 0.0) ? t0 : -1.0;
-}
-~~~~
-
-Both are returning -1 if there is no hit, otherwise, it returns the distance from to origin of the ray.
-
-Retrieving the ray is straight forward
-
-~~~~ C++
-void main()
-{
-  Ray ray;
-  ray.origin    = gl_WorldRayOriginEXT;
-  ray.direction = gl_WorldRayDirectionEXT;
-~~~~
-
-And getting the information about the geometry enclosed in the Aabb can be done like this.
-
-~~~~ C++
-  // Sphere data
-  Sphere sphere = allSpheres.i[gl_PrimitiveID];
-~~~~
-
-Now we just need to know if we will hit a sphere or a cube.
-
-~~~~ C++
-  float tHit    = -1;
-  int   hitKind = gl_PrimitiveID % 2 == 0 ? KIND_SPHERE : KIND_CUBE;
-  if(hitKind == KIND_SPHERE)
-  {
-    // Sphere intersection
-    tHit = hitSphere(sphere, ray);
-  }
-  else
-  {
-    // AABB intersection
-    Aabb aabb;
-    aabb.minimum = sphere.center - vec3(sphere.radius);
-    aabb.maximum = sphere.center + vec3(sphere.radius);
-    tHit         = hitAabb(aabb, ray);
-  }
-  ~~~~
-
-Intersection information is reported using `reportIntersectionEXT`, with a distance from the origin and a second argument (hitKind) that can be used to differentiate the primitive type.
-
-~~~~ C++
-
-  // Report hit point
-  if(tHit > 0)
-    reportIntersectionEXT(tHit, hitKind);
-}
-~~~~
-
-The shader can be found [here](shaders/raytrace.rint)
-
-### raytrace2.rchit
-
-The new closest hit can be found [here](shaders/raytrace2.rchit)
-
-This shader is almost identical to original `raytrace.rchit`, but since the primitive is implicit, we will only need to compute the normal for the primitive that was hit.
-
-We retrieve the world position from the ray and the `gl_HitTEXT` which was set in the intersection shader.
-
-~~~~ C++
-  vec3 worldPos = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT;
-~~~~
-
-The sphere information is retrieved the same way as in the `raytrace.rint` shader.
-
-~~~~ C++
-  Sphere instance = allSpheres.i[gl_PrimitiveID];
-~~~~
-
-Then we compute the normal, as for a sphere.
-
-~~~~ C++
-  // Computing the normal at hit position
-  vec3 normal = normalize(worldPos - instance.center);
-~~~~
-
-To know if we have intersect a cube rather than a sphere, we are using  `gl_HitKindEXT`, which was set in the second argument of `reportIntersectionEXT`.
-
-So when this is a cube, we set the normal to the major axis.
-
-~~~~ C++
-  // Computing the normal for a cube if the hit intersection was reported as 1
-  if(gl_HitKindEXT == KIND_CUBE)  // Aabb
-  {
-    vec3  absN = abs(normal);
-    float maxC = max(max(absN.x, absN.y), absN.z);
-    normal     = (maxC == absN.x) ?
-                 vec3(sign(normal.x), 0, 0) :
-                 (maxC == absN.y) ? vec3(0, sign(normal.y), 0) : vec3(0, 0, sign(normal.z));
-  }
-~~~~
+# Changes From the Original Code
+
+## Rendering / shader logic
+
+- **Depth of field** — the camera ray is now jittered over a lens disk and re-aimed at a
+  fixed focal plane (`aperture`, `focusDist` constants in the shared shader code), instead
+  of a single pinhole ray per pixel.
+- **Importance-sampled BRDF** — diffuse bounces use cosine-weighted hemisphere sampling and
+  specular bounces use GGX importance sampling, instead of the simpler/unweighted sampling
+  in the baseline. This converges to a clean image in fewer accumulated frames.
+- **Clear-coat material layer** — `microfacetBRDF` / `sampleMicrofacetBRDF` gained a second,
+  very smooth specular lobe (fixed IOR 1.5 → F0 = 0.04) layered on top of the base specular
+  lobe and energy-conserving with it, instead of a single specular lobe.
+- **Procedural materials (superseded)** — DiscoBot, StoneDemon and the VeachPlanes
+  (Cornell-box-style) surfaces originally got their base color from animated cosine-gradient
+  color palettes driven by position/normal, instead of a flat tint or texture-only lookup.
+  Procedural marble/wood noise helpers (`marbleColor`, `woodColor`, `fbm3`, `valueNoise3`,
+  `hash13`) were also added to the shared shader code. **All three of these surfaces have
+  since been switched to the concrete wall material below**, so the palette code paths are
+  currently unused, but the noise helpers remain in `raycommon.glsl`.
+- **Concrete wall material on DiscoBot, StoneDemon and VeachPlanes** — all three surfaces
+  (`gl_InstanceID` 0, 1 and 2) now sample a PolyHaven "concrete_wall_009" PBR texture set
+  (base color, roughness, tangent-space normal map) instead of the procedural cosine
+  palettes above, tiled 2× across each UV unwrap via `fract(texCoords * 2.0)`. The sampled
+  base color is also multiplied by `0.15` — the raw texture read as washed-out/overexposed
+  under this scene's bright area light and the bright HDR sky's indirect bounce lighting (a
+  `0.4` multiplier was tried first and still wasn't dark enough). Normal mapping reuses the
+  `cotangentFrame` / `applyNormalMap` helpers (added to `raycommon.glsl`) from the original
+  baseline shader, which builds a per-triangle tangent frame from the triangle's world-space
+  edges and UV deltas rather than needing precomputed vertex tangents.
+- **Reduced depth-of-field strength** — `aperture` in `raycommon.glsl` was lowered from
+  `0.045` to `0.012`. At `0.045` the lens blur was so strong that the background environment
+  was barely recognizable; the lower value keeps a subtle DOF effect while keeping the
+  background clearly visible.
+- **Street rat material (`gl_InstanceID == 3`)** — a new `else if` branch added to
+  `raytraceTri.rchit` / `raytraceAabb.rchit` for the street rat mesh (see "Scene
+  composition" below), sampling its own PolyHaven "street_rat" PBR texture set
+  (`textureRatDiff`/`Rough`/`Norm`, `textureSamplers[9..11]`) the same way the concrete
+  material above does, including the `cotangentFrame`/`applyNormalMap` normal mapping. The
+  base color is multiplied by `0.6` (lighter than the concrete material's `0.15`, since the
+  rat texture wasn't as overexposed).
+- **Soft area light** — the light sample position is jittered over a small sphere each
+  frame (soft shadows via Monte-Carlo accumulation), instead of being a fixed point light.
+- **HDR sky background** — the miss shader (`shaders/raytrace.rmiss`) now samples an
+  equirectangular HDR image (`data/background.hdr`) using the escaped ray's world direction,
+  instead of returning a flat near-black ambient color. This changes what camera rays and
+  bounce/reflection rays see when they leave the scene. Shadow rays use the same miss shader
+  but are unaffected, because `raytraceTri.rchit` / `raytraceAabb.rchit` always overwrite
+  `payload.directLight` with computed radiance right after a shadow trace completes. The
+  mapping's `v` coordinate was later flipped (`v = 1.0 - acos(d.z) / PI`, was
+  `v = acos(d.z) / PI`) because the sky was rendering upside down — the image's top row (sky)
+  was being sampled at the bottom of the direction sphere and vice versa. The HDR image
+  itself has also been swapped a couple of times (currently a cedar bridge environment) by
+  just replacing the contents of `data/background.hdr`; no code changes are needed to swap it.
+
+## Scene composition
+
+- **DiscoBot and StoneDemon scaled down** — `scaleBlas0` lowered from `1.8` to `1.4` and
+  `scaleBlas1` from `1` to `0.8` in `data/settings.txt`.
+- **DiscoBot and StoneDemon rotated to face each other** — `rotZBlas0` changed from `-70` to
+  `-90` and `rotZBlas1` from `0` to `90` in `data/settings.txt`. Both characters' default
+  (rotation-0) facing direction was determined empirically by temporarily pointing the
+  camera straight down at the scene (`camPos`/`camUp` edited in `raycommon.glsl`, then
+  reverted) to see which way each mesh faced before picking the rotation values, since
+  there's no other way to query a mesh's authored "forward" axis from this codebase.
+- **Street rat added as a 4th object**, standing on the VeachPlanes floor between DiscoBot
+  and StoneDemon. Positioned/scaled directly in `main.cpp` (`mesh3T`/`mesh3Scale`, not
+  driven by `settings.txt`) at `(0.05, -0.3, -0.96)` with a `10.0` scale factor — an initial
+  attempt at `(0.05, -0.6, -0.96)` with scale `4.0` was too small and got partly hidden
+  behind the floor's near edge from the camera's angle.
+
+## C++ / asset pipeline
+
+- `HelloVulkan::createTextureImages` (`hello_vulkan.cpp`) gained `.hdr` loading support via
+  `stbi_loadf`. The original loader only handled `.pfm` (via `loadPFM`) and 8-bit `.png`
+  (via `stbi_load`); HDR pixels are already linear floats and must not be divided by 255 the
+  way the 8-bit path does, but do need the same vertical flip to match the shader's sampling
+  convention.
+- `main.cpp` registers `data/background.hdr` as an additional texture (becoming
+  `textureSamplers[5]` / `textureBackground` in the miss shader), alongside the five
+  existing material textures (`texture0`-`texture4`).
+- `main.cpp` additionally registers the concrete wall texture set as three more textures —
+  `data/concreteDiff.jpg`, `data/concreteRough.png`, `data/concreteNorm.png` — becoming
+  `textureSamplers[6..8]` / `textureConcreteDiff`/`Rough`/`Norm` in `raytraceTri.rchit` and
+  `raytraceAabb.rchit`. The roughness and normal maps started as `.exr` files from the
+  source asset pack; since `stb_image` (used by this project's texture loader) can't decode
+  OpenEXR, they were converted to 8-bit PNGs offline with `opencv-python` before being added
+  to `data/`. The displacement map from that asset pack (`concrete_wall_009_disp_2k.png`) was
+  copied into `data/` but is not registered/used — this renderer has no
+  displacement/tessellation support.
+- **Street rat mesh (`data/mesh3.obj`)** — the source asset (`street_rat_2k.blend`) only
+  shipped as a Blender file, and this project's loader only reads `.obj`. Blender was
+  installed (`winget install BlenderFoundation.Blender`) and run headless
+  (`blender --background --python export_obj.py -- street_rat_2k.blend mesh3.obj`) to
+  export it. Its roughness/normal maps were `.exr` like the concrete set above and got the
+  same `opencv-python` → PNG conversion (`data/ratRough.png`, `data/ratNorm.png`); the
+  diffuse map (`data/ratDiff.jpg`) needed no conversion. Registered as a third
+  `additionalTextures` set in `main.cpp` (`ratTextures`), becoming
+  `textureSamplers[9..11]` after the concrete set.
+- **`HelloVulkan::createTopLevelAS` extended for a 4th object** (`hello_vulkan.cpp`) — this
+  function hardcoded exactly 3 instances, each independently toggleable between a triangle
+  mesh and a procedural-AABB representation via `settings.modelModeBlas0/1/2` (a leftover
+  from the original "intersection shader" tutorial/emulator this project is based on; the
+  AABB path is unused here since all three model modes are `1`). The street rat doesn't
+  participate in that toggle system — it's appended as one extra, always-triangle
+  `VkAccelerationStructureInstanceKHR` after the existing loop, referencing `m_objModel[3]`
+  directly, which is what makes it `gl_InstanceID == 3` in the shaders above.
+- `HelloVulkan::saveScreenshot` (`hello_vulkan.cpp`/`.h`) is a new method that copies the
+  offscreen ray-traced image (`m_offscreenColor`) to a host-visible staging buffer and writes
+  it out as a PNG via `stb_image_write`. `main.cpp`'s main loop calls it automatically a
+  couple of frames after the path-tracing accumulation finishes (`m_frameCounter` reaches
+  `settings.frameSize - 1`), saving to `render_output.png` next to the executable's project
+  directory and printing the save path to the console. The short frame delay exists so the
+  GPU has definitely finished writing the final accumulated sample before it's copied out.
+- **Render resolution decoupled from the window size (bug fix)** — the offscreen ray-traced
+  image, the `traceRaysKHR` dispatch extent, the raster fallback's viewport, and
+  `saveScreenshot` all used to read `m_size` (the GLFW window/swapchain size). Vulkan clamps
+  swapchain extents to fit the monitor, so requesting e.g. `2000x3000` in `settings.txt` on
+  a 1920x1080 screen silently produced a ~1924x1055 image with no error. Added a new
+  `m_renderSize` (`hello_vulkan.h`/`.cpp`), set once from `settings.launchSizeX/Y` via
+  `HelloVulkan::setRenderSize()` (called from `main.cpp` right after `loadSettings()`), and
+  switched `createOffscreenRender`, `updateUniformBuffer`'s aspect ratio, `rasterize`'s
+  viewport/scissor, the `traceRaysKHR` call, and `saveScreenshot` to use it instead of
+  `m_size`. The on-screen preview window still gets clamped to fit the screen (so the live
+  window may look stretched/cropped vs. the saved file), but `drawPost` — the pass that
+  blits the offscreen image onto the actual swapchain for display — intentionally still uses
+  `m_size`, since that one really does need to match the window.
+
+## Build / toolchain
+
+The original project targeted `nvpro_core` and Vulkan SDK 1.3.211 (~2022). Building and
+running it against a current Vulkan SDK (1.4.350) instead required three compatibility
+fixes, none of which change rendering behavior:
+
+- `vk::DynamicLoader` → `vk::detail::DynamicLoader` in `nvpro_core/nvvk/appbase_vkpp.cpp`,
+  since newer Vulkan-Hpp moved this type into the `detail` namespace.
+- Disabled the Vulkan Video extension function-pointer wrappers in
+  `nvpro_core/nvvk/extensions_vk.cpp` (`#undef VK_KHR_video_queue` and friends), because
+  their generated signatures no longer match the struct layouts in the newer Vulkan headers.
+  This project never uses video decode/encode, so the extension is simply turned off rather
+  than ported.
+- `m_device.createRayTracingPipelineKHR(...)` now returns a `vk::ResultValue<vk::Pipeline>`
+  instead of being implicitly convertible to `vk::Pipeline`, so the call site in
+  `hello_vulkan.cpp` reads `.value` off the result.

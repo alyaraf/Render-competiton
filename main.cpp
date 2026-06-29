@@ -101,6 +101,12 @@ int main(int argc, char** argv)
   int width = helloVk.settings.launchSizeX;
   int height = helloVk.settings.launchSizeY;
 
+  // NEW: the offscreen ray-traced image and the GLFW window/swapchain are
+  // decoupled (see m_renderSize comment in hello_vulkan.h) — the window's
+  // surface capabilities get clamped to fit the monitor, but the actual
+  // rendered/saved resolution should still be the full requested size.
+  helloVk.setRenderSize(static_cast<uint32_t>(width), static_cast<uint32_t>(height));
+
   glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
   GLFWwindow* window = glfwCreateWindow(width, height,
                                         PROJECT_NAME, nullptr, nullptr);
@@ -208,6 +214,21 @@ int main(int argc, char** argv)
   mesh2Scale.set_scale(nvmath::vec3f(helloVk.settings.scaleBlas2));
   mesh2Trans = mesh2T * mesh2Rx * mesh2Ry * mesh2Rz * mesh2Scale;
 
+  // NEW: street rat (mesh3), placed on the VeachPlanes floor between DiscoBot
+  // and StoneDemon. Hardcoded here rather than going through
+  // helloVk.settings.*Blas3 fields like the other three meshes, since adding a
+  // 4th slot to the Settings struct/parser/AABB toggle system (see
+  // HelloVulkan::createTopLevelAS, which hardcodes exactly 3 triangle/AABB
+  // toggle slots) wasn't needed for one fixed prop placement.
+  nvmath::mat4f mesh3Trans(1), mesh3T(1), mesh3Scale(1);
+  // CHANGED: was pos (0.05,-0.6,-0.96) scale 4.0 — too small and partly hidden
+  // behind the VeachPlanes floor's near edge from the camera's angle. Moved
+  // closer to the camera (less negative Y, in front of that edge) and scaled
+  // up so it reads clearly as a creature between the other two.
+  mesh3T.set_translation(nvmath::vec3f(0.05f, -0.3f, -0.96f));
+  mesh3Scale.set_scale(nvmath::vec3f(10.0f));
+  mesh3Trans = mesh3T * mesh3Scale;
+
   // additional textures
   // ??? extension is replaced by pfm or png
   std::vector<std::string> additionalTextures;
@@ -216,12 +237,42 @@ int main(int argc, char** argv)
   additionalTextures.push_back(NVPSystem ::exePath() + PROJECT_RELDIRECTORY + std::string("./data/texture2.???"));
   additionalTextures.push_back(NVPSystem ::exePath() + PROJECT_RELDIRECTORY + std::string("./data/texture3.???"));
   additionalTextures.push_back(NVPSystem ::exePath() + PROJECT_RELDIRECTORY + std::string("./data/texture4.???"));
+  // NEW: HDR sky environment used as the scene background. Loaded as texture
+  // index 5 (textureSamplers[5] / textureBackground in raytrace.rmiss) since it
+  // is pushed after texture0-4 above; see HelloVulkan::createTextureImages for
+  // the ".hdr" loading branch.
+  additionalTextures.push_back(NVPSystem ::exePath() + PROJECT_RELDIRECTORY + std::string("./data/background.hdr"));
+  // NEW: concrete wall PBR texture set (PolyHaven "concrete_wall_009"), applied
+  // to DiscoBot and StoneDemon in place of their procedural color palettes.
+  // Pushed after background.hdr, so these become indices 6/7/8
+  // (textureConcreteDiff/Rough/Norm in raytraceTri.rchit / raytraceAabb.rchit).
+  // The displacement map (concreteDisp.png) is not used: this renderer has no
+  // displacement/tessellation support, only base color + roughness + normal.
+  additionalTextures.push_back(NVPSystem ::exePath() + PROJECT_RELDIRECTORY + std::string("./data/concreteDiff.jpg"));
+  additionalTextures.push_back(NVPSystem ::exePath() + PROJECT_RELDIRECTORY + std::string("./data/concreteRough.png"));
+  additionalTextures.push_back(NVPSystem ::exePath() + PROJECT_RELDIRECTORY + std::string("./data/concreteNorm.png"));
+
+  // NEW: street rat PBR texture set (PolyHaven "street_rat"). Pushed via its
+  // own loadModel() call below (after mesh0/1/2), so these become indices
+  // 9/10/11 (textureRatDiff/Rough/Norm in raytraceTri.rchit /
+  // raytraceAabb.rchit) — mesh1.obj and mesh2.obj contribute no textures of
+  // their own (no embedded map_Kd material), so the running texture count
+  // stays unbroken between mesh0's additionalTextures and this one. The
+  // roughness/normal maps started as .exr files and were converted to PNG
+  // offline with opencv-python, same as the concrete textures above.
+  std::vector<std::string> ratTextures;
+  ratTextures.push_back(NVPSystem ::exePath() + PROJECT_RELDIRECTORY + std::string("./data/ratDiff.jpg"));
+  ratTextures.push_back(NVPSystem ::exePath() + PROJECT_RELDIRECTORY + std::string("./data/ratRough.png"));
+  ratTextures.push_back(NVPSystem ::exePath() + PROJECT_RELDIRECTORY + std::string("./data/ratNorm.png"));
 
   // loading meshes and additional textures
   helloVk.loadModel(NVPSystem ::exePath() + PROJECT_RELDIRECTORY + std::string("./data/mesh0.obj"), mesh0Trans,
                     additionalTextures);
   helloVk.loadModel(NVPSystem ::exePath() + PROJECT_RELDIRECTORY + std::string("./data/mesh1.obj"), mesh1Trans);
   helloVk.loadModel(NVPSystem ::exePath() + PROJECT_RELDIRECTORY + std::string("./data/mesh2.obj"), mesh2Trans);
+  // NEW: street rat, see mesh3Trans/ratTextures comments above.
+  helloVk.loadModel(NVPSystem ::exePath() + PROJECT_RELDIRECTORY + std::string("./data/mesh3.obj"), mesh3Trans,
+                    ratTextures);
 
   // creating intersection boxes
   helloVk.createAabbs(NVPSystem ::exePath() + PROJECT_RELDIRECTORY + std::string("./data/aabbBlas0.txt"), mesh0Trans, 0);
@@ -259,6 +310,13 @@ int main(int argc, char** argv)
 
   int lastMouseX, lastMouseY;
   CameraManip.getMousePosition(lastMouseX, lastMouseY);
+
+  // NEW: automatically save the rendered image once accumulation finishes.
+  // The save is delayed a couple of frames after frameCounter reaches its
+  // final value, so the frames-in-flight that wrote that last sample are
+  // guaranteed to have completed on the GPU before we copy the image out.
+  bool screenshotSaved      = false;
+  int  screenshotDelayFrames = -1;
 
   // Main loop
   while(!glfwWindowShouldClose(window))
@@ -302,10 +360,19 @@ int main(int argc, char** argv)
       {
         ImGui::Text("RENDERING FINISHED");
       }
-      
+
 
       ImGuiH::Control::Info("", "", "(F10) Toggle Pane", ImGuiH::Control::Flags::Disabled);
       ImGuiH::Panel::End();
+    }
+
+    // NEW: arm the delayed screenshot save once accumulation finishes. This is
+    // outside the showGui() block above so it still triggers even when the GUI
+    // pane is hidden (it's hidden by default via helloVk.hideGui()).
+    if(!screenshotSaved && screenshotDelayFrames < 0
+       && helloVk.m_frameCounter == helloVk.settings.frameSize - 1)
+    {
+      screenshotDelayFrames = 2;
     }
 
     // Start rendering the scene
@@ -369,6 +436,23 @@ int main(int argc, char** argv)
     // Submit for display
     cmdBuf.end();
     helloVk.submitFrame();
+
+    // NEW: perform the delayed screenshot save (see arming logic above). Waiting
+    // a couple of frames after submitFrame() ensures the GPU has actually
+    // finished writing the final accumulated sample before we copy it out.
+    if(screenshotDelayFrames > 0)
+    {
+      screenshotDelayFrames--;
+    }
+    else if(screenshotDelayFrames == 0 && !screenshotSaved)
+    {
+      std::string screenshotPath =
+          NVPSystem::exePath() + PROJECT_RELDIRECTORY + std::string("./render_output.png");
+      helloVk.saveScreenshot(screenshotPath);
+      screenshotSaved = true;
+      printf("Saved rendered image to: %s\n", screenshotPath.c_str());
+      fflush(stdout);
+    }
   }
 
   // Cleanup

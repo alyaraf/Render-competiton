@@ -364,7 +364,20 @@ void main() { /**** CLOSEST-HIT SHADER ****/
 }
 
 void main() { /**** MISS SHADER ****/
-  payload.directLight = vec3(0.01, 0.01, 0.02); 
+  // UPGRADE: HDR environment background.
+  // Was: payload.directLight = vec3(0.01, 0.01, 0.02); (flat near-black ambient color)
+  // Now: sample an equirectangular HDR image (data/background.hdr, bound as
+  // textureSamplers[5]) using the escaped ray's world direction, so camera rays
+  // and reflection/bounce rays that leave the scene pick up the sky instead of a
+  // constant color. This only affects camera-visible misses: shadow-ray misses
+  // also run this shader, but the closest-hit shader always overwrites
+  // payload.directLight with computed radiance afterward, so shadowing logic is
+  // unaffected by this change.
+  vec3 d = normalize(gl_WorldRayDirectionEXT);
+  // Equirectangular mapping (Z-up world, matches camUp = vec3(0,0,1))
+  float u = atan(d.y, d.x) / (2.0 * PI) + 0.5;
+  float v = acos(clamp(d.z, -1.0, 1.0)) / PI;
+  payload.directLight = texture(textureSamplers[5], vec2(u, v)).rgb;
   payload.shadowRayMiss = true;
   payload.nextRayOrigin = vec3(0.0); payload.nextRayDirection = vec3(0.0);
 }

@@ -72,30 +72,40 @@ void main()
   vec3 baseColor = vec3(0.8);
   bool isRefractive = false;
 
-  if(gl_InstanceID == 2) {
-    if (normal.z > 0.95) { // Floor
-        float pattern = mod(floor(position.x * 4.0) + floor(position.y * 4.0), 2.0);
-        baseColor = (pattern > 0.5) ? vec3(0.00, 0.23, 0.19) : vec3(0.85);
-        roughness = 0.15;
-        clearcoat = 1.0; // Apply highly polished clearcoat to the floor
-    } else if (normal.z < -0.95) { // Ceiling
-        baseColor = vec3(0.92, 0.92, 0.95); roughness = 0.3;
-    } else if (texCoords.x < 0.25 || (texCoords.x >= 0.5 && texCoords.x < 0.75)) { // Side Walls
-        float stripePattern = mod(floor(position.z * 10.0), 2.0);
-        baseColor = (stripePattern > 0.5) ? pow(vec3(0.95, 0.35, 0.03), vec3(2.2)) : vec3(0.90, 0.88, 0.85);
-        roughness = 0.25;
-        clearcoat = 0.5; // Slight sheen on the walls
-    } else { // Back Wall
-        baseColor = pow(vec3(0.85, 0.05, 0.08), vec3(2.2));
-        roughness = 0.20;
-    }
-  } 
-  else if(gl_InstanceID == 0 || gl_InstanceID == 1) { // Glass Objects
-    isRefractive = true;
-    metallicness = 0.0;
-    roughness = 0.01; 
-    fresnelReflect = 1.0;
-    baseColor = vec3(0.99, 0.99, 1.0); 
+  if(gl_InstanceID == 2) { // VeachPlanes - artistic cosine-gradient palette
+    vec3 paletteA = vec3(0.55, 0.45, 0.65);
+    vec3 paletteB = vec3(0.45, 0.45, 0.35);
+    vec3 paletteC = vec3(1.0, 1.0, 0.6);
+    vec3 paletteD = vec3(0.10, 0.45, 0.75);
+    float t = position.x * 0.6 + position.y * 0.35 + position.z * 0.2;
+    baseColor = clamp(paletteA + paletteB * cos(2.0 * PI * (paletteC * t + paletteD)), 0.0, 1.0);
+    roughness = 0.2;
+    fresnelReflect = 0.5;
+    clearcoat = 0.4;
+  }
+  else if(gl_InstanceID == 0) { // DiscoBot (blas0) - shimmering disco-ball cosine palette
+    vec3 discoA = vec3(0.5, 0.5, 0.5);
+    vec3 discoB = vec3(0.5, 0.5, 0.5);
+    vec3 discoC = vec3(2.0, 1.5, 1.0);
+    vec3 discoD = vec3(0.0, 0.25, 0.5);
+    float dt = normal.x * 0.5 + normal.y * 0.5 + normal.z * 0.3 + position.z * 0.4;
+    baseColor = clamp(discoA + discoB * cos(2.0 * PI * (discoC * dt + discoD)), 0.0, 1.0);
+    metallicness = 0.6;
+    roughness = 0.15;
+    fresnelReflect = 0.7;
+    clearcoat = 0.6; // shiny disco-ball sheen
+  }
+  else if(gl_InstanceID == 1) { // StoneDemon (blas1) - molten/hellish cosine palette
+    vec3 demonA = vec3(0.45, 0.20, 0.15);
+    vec3 demonB = vec3(0.45, 0.25, 0.10);
+    vec3 demonC = vec3(1.2, 1.0, 0.8);
+    vec3 demonD = vec3(0.0, 0.10, 0.30);
+    float mt = position.z * 0.8 + normal.y * 0.3;
+    baseColor = clamp(demonA + demonB * cos(2.0 * PI * (demonC * mt + demonD)), 0.0, 1.0);
+    metallicness = 0.1;
+    roughness = 0.35;
+    fresnelReflect = 0.5;
+    clearcoat = 0.3; // faint molten sheen
   }
 
   vec3 lightPos = vec3(0.5, -2.0, 0.7) + normalize(random_pcg3d(uvec3(frameID, gl_LaunchIDEXT.xy))) * 0.2;

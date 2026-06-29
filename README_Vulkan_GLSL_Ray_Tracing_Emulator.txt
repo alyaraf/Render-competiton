@@ -12,7 +12,7 @@ In the file
 vk_raytracing_tutorial_KHR/CMakeList.txt
 
 add the line
-"add_subdirectory(rt_emulator_20260629_0428_export)"
+"add_subdirectory(rt_emulator_20260629_0079_export)"
 
 and re-run cmake on the vk_raytracing_tutorial_KHR directory.
 

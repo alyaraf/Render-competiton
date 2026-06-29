@@ -22,7 +22,7 @@ rotXBlas1: 0
 rotYBlas1: 0
 rotZBlas1: 0
 scaleBlas1: 1
-meshFileBlas2: CornellBox
+meshFileBlas2: VeachPlanes
 modelModeBlas2: 1
 posXBlas2: 0
 posYBlas2: 0

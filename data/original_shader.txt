@@ -1,0 +1,370 @@
+// gsnShaderOptions: precompiler="GL_EXT_ray_tracing, recursion: 2, app: 1"
+// IMPORTANT: do not remove the line above
+
+/**** ABOUT ****/
+// Advanced Path Tracing with Importance Sampling and Dual-Lobe PBR
+
+/**** COMMON START ****/
+struct RayPayloadType {
+  vec3 directLight;
+  vec3 nextRayOrigin;
+  vec3 nextRayDirection;
+  vec3 nextFactor;
+  bool shadowRayMiss;
+  int level;
+}; 
+
+struct HitAttributeType {
+  vec3 normal; 
+}; 
+
+const vec3 camPos = vec3(0.0f, -4.75f, 0.0f);
+const vec3 camLookAt = vec3(0.0f, 0.0f, 0.0f);
+const vec3 camUp = vec3(0.0, 0.0, 1.0);
+const float PI = 3.14159265359;
+
+vec3 getCameraRayLookAt(float fieldOfViewY, float aspectRatio, 
+                        vec3 eye, vec3 ref, vec3 up, vec2 point) {
+  float focalLength = 1.0 / tan(0.5 * fieldOfViewY * PI / 180.0);
+  vec2 pos = 2.0 * (point - 0.5);
+  vec3 rayCam = vec3(pos.x * aspectRatio, pos.y, -focalLength);
+  
+  vec3 camZ = normalize(eye - ref);
+  vec3 v = normalize(up);
+  vec3 camX = cross(v, camZ);
+  vec3 camY = cross(camZ, camX);
+  
+  return normalize(camX * rayCam.x + camY * rayCam.y + camZ * rayCam.z);
+}
+
+float radicalInverse(uint bits) {
+  bits = (bits << 16u) | (bits >> 16u);
+  bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+  bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+  bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+  bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+  return float(bits) * 2.3283064365386963e-10; 
+}
+
+vec2 hammersley(uint n, uint N) {
+  return vec2((float(n) + 0.5) / float(N), radicalInverse(n + 1u));
+}
+
+vec3 random_pcg3d(uvec3 v) {
+  v = v * 1664525u + 1013904223u;
+  v.x += v.y*v.z; v.y += v.z*v.x; v.z += v.x*v.y;
+  v ^= v >> 16u;
+  v.x += v.y*v.z; v.y += v.z*v.x; v.z += v.x*v.y;
+  return vec3(v) * (1.0/float(0xffffffffu));
+}
+
+mat3 getNormalSpace(in vec3 normal) {
+   vec3 someVec = vec3(1.0, 0.0, 0.0);
+   float dd = dot(someVec, normal);
+   vec3 tangent = vec3(0.0, 1.0, 0.0);
+   if(1.0 - abs(dd) > 1e-6) tangent = normalize(cross(someVec, normal));
+   vec3 bitangent = cross(normal, tangent);
+   return mat3(tangent, bitangent, normal);
+}
+
+vec3 fresnelSchlick(float cosTheta, vec3 F0) {
+  return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+} 
+
+float D_GGX(float NoH, float roughness) {
+  float alpha = roughness * roughness;
+  float alpha2 = alpha * alpha;
+  float NoH2 = NoH * NoH;
+  float b = (NoH2 * (alpha2 - 1.0) + 1.0);
+  return alpha2 / (PI * b * b);
+}
+
+float G1_GGX_Schlick(float NdotV, float roughness) {
+  float r = 0.5 + 0.5 * roughness; 
+  float k = (r * r) / 2.0;
+  float denom = NdotV * (1.0 - k) + k;
+  return NdotV / denom;
+}
+
+float G_Smith(float NoV, float NoL, float roughness) {
+  return G1_GGX_Schlick(NoL, roughness) * G1_GGX_Schlick(NoV, roughness);
+}
+
+// UPGRADE: Advanced BRDF with a Clear-Coat layer calculation
+vec3 microfacetBRDF(in vec3 L, in vec3 V, in vec3 N, 
+              in vec3 baseColor, in float metallicness, 
+              in float fresnelReflect, in float roughness, in float clearcoat) {
+      
+  vec3 H = normalize(V + L); 
+  float NoV = clamp(dot(N, V), 0.0, 1.0);
+  float NoL = clamp(dot(N, L), 0.0, 1.0);
+  float NoH = clamp(dot(N, H), 0.0, 1.0);
+  float VoH = clamp(dot(V, H), 0.0, 1.0);     
+  
+  // Base Specular Lobe
+  vec3 f0 = mix(vec3(0.16 * (fresnelReflect * fresnelReflect)), baseColor, metallicness);
+  vec3 F = fresnelSchlick(VoH, f0);
+  float D = D_GGX(NoH, roughness);
+  float G = G_Smith(NoV, NoL, roughness);
+  vec3 baseSpec = (D * G * F) / max(4.0 * NoV * NoL, 0.001);
+  
+  // UPGRADE: Secondary Clear-Coat Lobe (fixed IOR 1.5 -> F0 = 0.04)
+  float ccRoughness = 0.05; // very smooth top layer
+  vec3 ccF = fresnelSchlick(VoH, vec3(0.04)) * clearcoat;
+  float ccD = D_GGX(NoH, ccRoughness);
+  float ccG = G_Smith(NoV, NoL, ccRoughness);
+  vec3 clearcoatSpec = (ccD * ccG * ccF) / max(4.0 * NoV * NoL, 0.001);
+
+  // Energy Conservation & Diffuse
+  vec3 notSpec = vec3(1.0) - F; 
+  notSpec *= 1.0 - metallicness; 
+  // Attenuate base layer by the clearcoat transmission
+  vec3 diff = notSpec * baseColor / PI * (vec3(1.0) - ccF); 
+  
+  return diff + baseSpec + clearcoatSpec;
+}
+
+// UPGRADE: Cosine-Weighted Importance Sampling
+vec3 sampleMicrofacetBRDF(in vec3 V, in vec3 N, 
+              in vec3 baseColor, in float metallicness, 
+              in float fresnelReflect, in float roughness, in vec3 random, out vec3 nextFactor) 
+{
+  if(random.z > 0.5) {
+    // Diffuse: Cosine-weighted hemisphere sampling (solves PDF = cosTheta / PI)
+    float r1 = random.x;
+    float r2 = random.y;
+    float phi = 2.0 * PI * r1;
+    float cosTheta = sqrt(1.0 - r2);
+    float sinTheta = sqrt(r2);
+    
+    vec3 localDiffuseDir = vec3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+    vec3 L = getNormalSpace(N) * localDiffuseDir;  
+    
+    vec3 H = normalize(V + L);
+    float VoH = clamp(dot(V, H), 0.0, 1.0);     
+    
+    vec3 f0 = mix(vec3(0.16 * (fresnelReflect * fresnelReflect)), baseColor, metallicness);    
+    vec3 F = fresnelSchlick(VoH, f0);
+    vec3 notSpec = (vec3(1.0) - F) * (1.0 - metallicness); 
+  
+    // PDF cancels out with the PI denominator, leaving just the albedo
+    nextFactor = notSpec * baseColor * 2.0; 
+    return L;
+    
+  } else {
+    // Specular: GGX Importance Sampling
+    float a = roughness * roughness;
+    float phi = 2.0 * PI * random.x;
+    float cosTheta = sqrt((1.0 - random.y) / (1.0 + (a * a - 1.0) * random.y));
+    float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+    
+    vec3 localH = vec3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+    vec3 H = getNormalSpace(N) * localH;  
+    vec3 L = reflect(-V, H);
+
+    float NoV = clamp(dot(N, V), 0.0, 1.0);
+    float NoL = clamp(dot(N, L), 0.0, 1.0);
+    float NoH = clamp(dot(N, H), 0.0, 1.0);
+    float VoH = clamp(dot(V, H), 0.0, 1.0);     
+    
+    vec3 f0 = mix(vec3(0.16 * (fresnelReflect * fresnelReflect)), baseColor, metallicness);
+    vec3 F = fresnelSchlick(VoH, f0);
+    float G = G_Smith(NoV, NoL, roughness);
+    
+    nextFactor = (F * G * VoH / max(NoH * NoV, 0.001)) * 2.0;
+    return L;
+  }
+}
+
+// UPGRADE: Depth of Field (camera lens) settings
+const float aperture  = 0.045; // lens radius: bigger = stronger blur
+const float focusDist = 4.2;   // distance from camera to the in-focus plane
+
+// UPGRADE: Procedural marble (turbulent veins) and wood (concentric rings) materials
+float hash13(vec3 p) {
+  p = fract(p * 0.3183099 + 0.1);
+  p *= 17.0;
+  return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+}
+
+float valueNoise3(vec3 p) {
+  vec3 i = floor(p);
+  vec3 f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(mix(hash13(i + vec3(0, 0, 0)), hash13(i + vec3(1, 0, 0)), f.x),
+                  mix(hash13(i + vec3(0, 1, 0)), hash13(i + vec3(1, 1, 0)), f.x), f.y),
+              mix(mix(hash13(i + vec3(0, 0, 1)), hash13(i + vec3(1, 0, 1)), f.x),
+                  mix(hash13(i + vec3(0, 1, 1)), hash13(i + vec3(1, 1, 1)), f.x), f.y), f.z);
+}
+
+float fbm3(vec3 p) {
+  float v = 0.0; float amp = 0.5;
+  for(int i = 0; i < 5; i++) {
+    v += amp * valueNoise3(p);
+    p *= 2.0; amp *= 0.5;
+  }
+  return v;
+}
+
+vec3 marbleColor(vec3 p, vec3 baseTint, vec3 veinTint) {
+  float n = fbm3(p * 3.0);
+  float vein = sin((p.x + p.y * 0.3) * 8.0 + n * 12.0) * 0.5 + 0.5;
+  vein = pow(vein, 3.0);
+  return mix(baseTint, veinTint, vein);
+}
+
+vec3 woodColor(vec3 p, vec3 lightWood, vec3 darkWood) {
+  float n = fbm3(p * 1.5) * 0.6;
+  float radius = length(p.xy) + n;
+  float rings = fract(radius * 6.0);
+  rings = smoothstep(0.0, 0.15, rings) * smoothstep(1.0, 0.85, rings);
+  return mix(darkWood, lightWood, rings);
+}
+/**** COMMON END ****/
+
+void main() { /**** RAY GENERATION SHADER ****/
+  vec2 pixelOffset = hammersley(uint(frameID), uint(frameSize));
+  vec2 texCoord = (vec2(gl_LaunchIDEXT.xy) + pixelOffset) / vec2(gl_LaunchSizeEXT.xy);
+  float aspect = float(gl_LaunchSizeEXT.x) / float(gl_LaunchSizeEXT.y);
+  vec3 rayOrigin = camPos;
+  vec3 rayDirection = getCameraRayLookAt(30.0, aspect, camPos, camLookAt, camUp, texCoord);
+
+  // UPGRADE: Depth of Field - jitter the eye over a lens disk and re-aim at the focal plane
+  vec3 camZ = normalize(camPos - camLookAt);
+  vec3 camX = normalize(cross(normalize(camUp), camZ));
+  vec3 camY = cross(camZ, camX);
+
+  vec3 focalPoint = rayOrigin + rayDirection * focusDist;
+  vec2 lensRnd = random_pcg3d(uvec3(gl_LaunchIDEXT.xy, uint(frameID) + 7u)).xy;
+  float lensR = aperture * sqrt(lensRnd.x);
+  float lensPhi = 2.0 * PI * lensRnd.y;
+  vec2 lensOffset = lensR * vec2(cos(lensPhi), sin(lensPhi));
+
+  rayOrigin = rayOrigin + camX * lensOffset.x + camY * lensOffset.y;
+  rayDirection = normalize(focalPoint - rayOrigin);
+
+  uint rayFlags = gl_RayFlagsNoneEXT;
+  float rayMin = 0.001; float rayMax = 10000.0;
+
+  payload.nextRayOrigin = rayOrigin;
+  payload.nextRayDirection = rayDirection;
+  payload.nextFactor = vec3(1.0);
+  vec3 contribution = vec3(1.0);
+  vec3 color = vec3(0.0);
+
+  int level = 0; const int maxLevel = 5;
+
+  while(length(payload.nextRayDirection) > 0.1 && level < maxLevel && length(contribution) > 0.001) {
+    payload.level = level;
+    traceRayEXT(topLevelAS, rayFlags, 0xFFu, 0u, 0u, 0u,
+            payload.nextRayOrigin, rayMin, payload.nextRayDirection, rayMax, 0);
+
+    color += contribution * payload.directLight;
+    contribution *= payload.nextFactor;
+    level++;
+  }
+
+  if(frameID == 0) {
+    gsnSetPixel(vec4(pow(color, vec3(1.0 / 2.2)), 1.0));
+  } else {
+    vec3 previousAverage = pow(gsnGetPreviousPixel().rgb, vec3(2.2));
+    vec3 newAverage = pow((previousAverage * float(frameID) + color) / float(frameID + 1), vec3(1.0 / 2.2));
+    gsnSetPixel(vec4(newAverage, 1.0));
+  }
+}
+
+void main() { /**** CLOSEST-HIT SHADER ****/
+  vec3 p0, p1, p2, n0, n1, n2;
+  vec2 t0, t1, t2;
+  gsnGetPositions(gl_InstanceID, gl_PrimitiveID, p0, p1, p2);
+  gsnGetNormals(gl_InstanceID, gl_PrimitiveID, n0, n1, n2);
+  gsnGetTexCoords(gl_InstanceID, gl_PrimitiveID, t0, t1, t2);
+
+  vec3 barys = vec3(1.0f - baryCoord.x - baryCoord.y, baryCoord.x, baryCoord.y);
+  vec3 localNormal = normalize(n0 * barys.x + n1 * barys.y + n2 * barys.z);
+  vec3 localPosition = p0 * barys.x + p1 * barys.y + p2 * barys.z;
+  vec2 texCoords = t0 * barys.x + t1 * barys.y + t2 * barys.z;
+
+  mat3 normalMat;
+  gsnGetNormal3x3Matrix(gl_InstanceID, normalMat);
+  vec3 normal = normalize(normalMat * localNormal);
+  vec3 position = gl_ObjectToWorldEXT * vec4(localPosition, 1.0);
+  vec3 viewDir = normalize(-gl_WorldRayDirectionEXT);
+  
+  float metallicness = 0.0;
+  float fresnelReflect = 0.5;
+  float roughness = 0.1;
+  float clearcoat = 0.0; // New parameter
+  vec3 emission = vec3(0.0);
+  vec3 baseColor = vec3(0.8);
+  bool isRefractive = false;
+
+  if(gl_InstanceID == 2) { // VeachPlanes - artistic cosine-gradient palette
+    vec3 paletteA = vec3(0.55, 0.45, 0.65);
+    vec3 paletteB = vec3(0.45, 0.45, 0.35);
+    vec3 paletteC = vec3(1.0, 1.0, 0.6);
+    vec3 paletteD = vec3(0.10, 0.45, 0.75);
+    float t = position.x * 0.6 + position.y * 0.35 + position.z * 0.2;
+    baseColor = clamp(paletteA + paletteB * cos(2.0 * PI * (paletteC * t + paletteD)), 0.0, 1.0);
+    roughness = 0.2;
+    fresnelReflect = 0.5;
+    clearcoat = 0.4;
+  }
+  else if(gl_InstanceID == 0) { // DiscoBot (blas0) - shimmering disco-ball cosine palette
+    vec3 discoA = vec3(0.5, 0.5, 0.5);
+    vec3 discoB = vec3(0.5, 0.5, 0.5);
+    vec3 discoC = vec3(2.0, 1.5, 1.0);
+    vec3 discoD = vec3(0.0, 0.25, 0.5);
+    float dt = normal.x * 0.5 + normal.y * 0.5 + normal.z * 0.3 + position.z * 0.4;
+    baseColor = clamp(discoA + discoB * cos(2.0 * PI * (discoC * dt + discoD)), 0.0, 1.0);
+    metallicness = 0.6;
+    roughness = 0.15;
+    fresnelReflect = 0.7;
+    clearcoat = 0.6; // shiny disco-ball sheen
+  }
+  else if(gl_InstanceID == 1) { // StoneDemon (blas1) - molten/hellish cosine palette
+    vec3 demonA = vec3(0.45, 0.20, 0.15);
+    vec3 demonB = vec3(0.45, 0.25, 0.10);
+    vec3 demonC = vec3(1.2, 1.0, 0.8);
+    vec3 demonD = vec3(0.0, 0.10, 0.30);
+    float mt = position.z * 0.8 + normal.y * 0.3;
+    baseColor = clamp(demonA + demonB * cos(2.0 * PI * (demonC * mt + demonD)), 0.0, 1.0);
+    metallicness = 0.1;
+    roughness = 0.35;
+    fresnelReflect = 0.5;
+    clearcoat = 0.3; // faint molten sheen
+  }
+
+  vec3 lightPos = vec3(0.5, -2.0, 0.7) + normalize(random_pcg3d(uvec3(frameID, gl_LaunchIDEXT.xy))) * 0.2;
+  vec3 lightDir = normalize(lightPos - position);
+  float frontFacing = dot(-gl_WorldRayDirectionEXT, normal);
+  
+  payload.shadowRayMiss = false;
+  traceRayEXT(topLevelAS, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT, 0xFFu, 0u, 0u, 0u, 
+      position + sign(frontFacing) * 0.001 * normal, 0.001, lightDir, length(lightPos - position), 0);
+  
+  vec3 radiance = vec3(0.0); 
+  if(payload.shadowRayMiss || frontFacing < 0.0) { 
+    float irradiance = max(dot(lightDir, normal), 0.0) * (4.0 * PI * 0.04) * (1.0 / pow(max(length(lightPos - position), 0.1), 2.0)) * 200.0;
+    if(irradiance > 0.0) radiance += microfacetBRDF(lightDir, viewDir, normal, baseColor, metallicness, fresnelReflect, roughness, clearcoat) * irradiance; 
+  }  
+  
+  payload.directLight = (payload.level > 0) ? clamp(radiance, 0.0, 5.0) + emission : radiance + emission;
+  
+  if (isRefractive) {
+      vec3 outwardNormal = (frontFacing < 0.0) ? -normal : normal;
+      vec3 refrDir = refract(-viewDir, outwardNormal, (frontFacing < 0.0) ? 1.52 : 1.0 / 1.52);
+      payload.nextRayOrigin = position - outwardNormal * 0.002;
+      payload.nextRayDirection = (refrDir == vec3(0.0)) ? reflect(-viewDir, normal) : refrDir;
+      payload.nextFactor = vec3(0.98); 
+  } else {
+      payload.nextRayOrigin = position;
+      payload.nextRayDirection = sampleMicrofacetBRDF(viewDir, normal, baseColor, metallicness, fresnelReflect, roughness, random_pcg3d(uvec3(gl_LaunchIDEXT.xy, frameID + payload.level)), payload.nextFactor);
+  }
+}
+
+void main() { /**** MISS SHADER ****/
+  payload.directLight = vec3(0.01, 0.01, 0.02); 
+  payload.shadowRayMiss = true;
+  payload.nextRayOrigin = vec3(0.0); payload.nextRayDirection = vec3(0.0);
+}

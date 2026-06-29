@@ -1,0 +1,79 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_GOOGLE_include_directive : enable
+#include "raycommon.glsl"
+
+layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
+layout(binding = 1, set = 0, rgba32f) uniform image2D image;
+
+layout(location = 0) rayPayloadEXT RayPayloadType payload;
+
+layout(binding = 0, set = 1) uniform CameraProperties
+{
+  mat4 view;
+  mat4 proj;
+  mat4 viewInverse;
+  mat4 projInverse;
+}
+cam;
+
+// clang-format on
+layout(push_constant) uniform Constants
+{
+  vec4  clearColorRt;
+  vec3  lightPositionRt;
+  float lightIntensityRt;
+  int lightTypeRt;
+  int frameID;
+  int frameSize;
+  float userParam0;
+  float userParam1;
+  float userParam2;
+};
+
+void gsnSetPixel(vec4 color) {
+  imageStore(image, ivec2(gl_LaunchIDEXT.x, gl_LaunchSizeEXT.y - 1 - gl_LaunchIDEXT.y), color);
+}
+
+vec4 gsnGetPreviousPixel() {
+  return imageLoad(image, ivec2(gl_LaunchIDEXT.x, gl_LaunchSizeEXT.y - 1 - gl_LaunchIDEXT.y));
+}
+
+void main()
+{  /**** RAY GENERATION SHADER ****/
+  vec2 pixelOffset = hammersley(uint(frameID), uint(frameSize));
+  vec2 texCoord = (vec2(gl_LaunchIDEXT.xy) + pixelOffset) / vec2(gl_LaunchSizeEXT.xy);
+  float aspect = float(gl_LaunchSizeEXT.x) / float(gl_LaunchSizeEXT.y);
+  vec3 rayOrigin = camPos;
+  vec3 rayDirection = getCameraRayLookAt(30.0, aspect, camPos, camLookAt, camUp, texCoord);
+  
+  uint rayFlags = gl_RayFlagsNoneEXT; 
+  float rayMin = 0.001; float rayMax = 10000.0;   
+  
+  payload.nextRayOrigin = rayOrigin;
+  payload.nextRayDirection = rayDirection;
+  payload.nextFactor = vec3(1.0);
+  vec3 contribution = vec3(1.0);
+  vec3 color = vec3(0.0);
+  
+  int level = 0; const int maxLevel = 5;
+  
+  while(length(payload.nextRayDirection) > 0.1 && level < maxLevel && length(contribution) > 0.001) {
+    payload.level = level;
+    traceRayEXT(topLevelAS, rayFlags, 0xFFu, 0u, 0u, 0u, 
+            payload.nextRayOrigin, rayMin, payload.nextRayDirection, rayMax, 0);
+
+    color += contribution * payload.directLight;
+    contribution *= payload.nextFactor;
+    level++;
+  }
+
+  if(frameID == 0) {
+    gsnSetPixel(vec4(pow(color, vec3(1.0 / 2.2)), 1.0));
+  } else {
+    vec3 previousAverage = pow(gsnGetPreviousPixel().rgb, vec3(2.2)); 
+    vec3 newAverage = pow((previousAverage * float(frameID) + color) / float(frameID + 1), vec3(1.0 / 2.2)); 
+    gsnSetPixel(vec4(newAverage, 1.0));
+  }
+
+}

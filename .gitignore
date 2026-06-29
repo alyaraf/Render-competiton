@@ -1,0 +1,7 @@
+build/
+spv/
+*.spv
+.vs/
+.vscode/
+CMakeFiles/
+CMakeCache.txt
